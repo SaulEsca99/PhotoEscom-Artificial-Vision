@@ -9,8 +9,6 @@ Además de las herramientas de edición estándar (rotar, ajustar brillo, filtro
 
 ## 🖼️ Vistazo a la Interfaz
 
-*(Te recomiendo encarecidamente tomar un screenshot de tu aplicación y ponerla aquí. Hará que tu repositorio se vea 100 veces más profesional. Nombra el screenshot `demo.png` y súbelo al repositorio)*
-
 ![Demo de PhotoEscom](demo.png)
 
 ## ✨ Características Principales
