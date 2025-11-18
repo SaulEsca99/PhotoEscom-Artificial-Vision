@@ -321,7 +321,3 @@ Además de la GUI, los módulos de visión (`vision_methods.py`, `skeleton_perim
 Para detalles, consulta `integration_guide.py`.
 
 ---
-
-## 📄 Licencia
-
-Indica aquí la licencia de tu proyecto (MIT, GPL, etc.), si aplica.
