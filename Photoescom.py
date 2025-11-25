@@ -1,13 +1,21 @@
-from inference_sdk import InferenceHTTPClient
+"""
+PhotoEscom - Editor de Imágenes con Visión por Computadora
+Reconocimiento de billetes 100% local con SVM (sin APIs externas)
+"""
+
 from vision_methods import OtsuThreshold, HarrisCornerDetector
 from skeleton_perimeter import SkeletonizationMethods, PerimeterAnalysis
 from segmentation_template import ImageSegmentation, TemplateMatching
+from bill_detector import BillDetector
+from train_bill_model import extract_enhanced_descriptors
+
 import numpy as np
 import cv2
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk, ImageFilter, ImageEnhance
 import os
+import pickle
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter, label, binary_dilation
 
@@ -15,7 +23,7 @@ from scipy.ndimage import gaussian_filter, label, binary_dilation
 class PhotoEditor:
     def __init__(self, root):
         self.root = root
-        self.root.title("PhotoEscom - Editor de Fotos Profesional")
+        self.root.title("PhotoEscom - Editor Profesional + Reconocimiento de Billetes")
         self.root.geometry("1400x900")
         self.root.configure(bg='#2e2e2e')
         self.root.minsize(1200, 700)
@@ -39,14 +47,12 @@ class PhotoEditor:
         self.sharpen_var = tk.DoubleVar(value=1.0)
         self.filter_var = tk.StringVar(value="original")
 
-        # Variables para detección de bordes (basadas en PDF)
+        # Variables para detección de bordes
         self.edge_operator_var = tk.StringVar(value="sobel")
         self.threshold_var = tk.DoubleVar(value=30.0)
         self.sigma_var = tk.DoubleVar(value=1.0)
         self.canny_low_var = tk.DoubleVar(value=50.0)
         self.canny_high_var = tk.DoubleVar(value=150.0)
-
-        # Variables adicionales del PDF
         self.roberts_form_var = tk.StringVar(value="sqrt")
         self.show_magnitude_var = tk.BooleanVar(value=False)
         self.show_angle_var = tk.BooleanVar(value=False)
@@ -66,18 +72,24 @@ class PhotoEditor:
         self.template_method_var = tk.StringVar(value="opencv")
         self.template_image = None
 
-        # Para reconocimiento
-        self.clf = None
-        self.scaler = None
-        self.conf_threshold_var = tk.DoubleVar(value=0.1)  # Nuevo: umbral ajustable
-        self.preprocess_var = tk.BooleanVar(value=True)  # Nuevo: preprocesar imagen
+        # Variables para reconocimiento de billetes (SVM)
+        self.recognition_confidence_var = tk.DoubleVar(value=0.5)
+        self.preprocess_bills_var = tk.BooleanVar(value=True)
+        self.show_all_detections_var = tk.BooleanVar(value=False)
+
+        # Modelo SVM
+        self.svm_model = None
+        self.svm_scaler = None
+        self.svm_class_names = None
+
+        # Detector de billetes
+        self.bill_detector = BillDetector()
 
         # Traces para previews
         self.brightness_var.trace('w', self.preview_adjustments)
         self.contrast_var.trace('w', self.preview_adjustments)
         self.saturation_var.trace('w', self.preview_adjustments)
         self.sharpen_var.trace('w', self.preview_adjustments)
-
         self.rotate_var.trace('w', self.preview_transforms)
         self.scale_x_var.trace('w', self.preview_transforms)
         self.scale_y_var.trace('w', self.preview_transforms)
@@ -88,11 +100,13 @@ class PhotoEditor:
         # Crear interfaz
         self.create_widgets()
 
+        # Cargar modelo SVM al iniciar
+        self.load_svm_model()
+
     def setup_styles(self):
         self.style = ttk.Style()
         self.style.theme_use('clam')
 
-        # Configurar colores
         self.bg_color = '#2e2e2e'
         self.frame_bg = '#3c3c3c'
         self.button_bg = '#4a4a4a'
@@ -100,7 +114,6 @@ class PhotoEditor:
         self.text_color = '#ffffff'
         self.highlight_color = '#4a76cf'
 
-        # Configurar estilos
         self.style.configure('TFrame', background=self.frame_bg)
         self.style.configure('TLabel', background=self.frame_bg, foreground=self.text_color)
         self.style.configure('TButton', background=self.button_bg, foreground=self.text_color,
@@ -114,21 +127,48 @@ class PhotoEditor:
         self.style.map('TNotebook.Tab', background=[('selected', self.accent_color)])
         self.style.map('TButton', background=[('active', self.highlight_color)])
 
+    def load_svm_model(self):
+        """Carga el modelo SVM entrenado"""
+        model_path = 'models/bill_recognizer.pkl'
+
+        if not os.path.exists(model_path):
+            print("⚠️  Modelo SVM no encontrado")
+            print(f"   Ejecuta 'python train_bill_model.py' primero")
+            return False
+
+        try:
+            with open(model_path, 'rb') as f:
+                model_data = pickle.load(f)
+
+            self.svm_model = model_data['classifier']
+            self.svm_scaler = model_data['scaler']
+            self.svm_class_names = model_data['class_names']
+
+            test_acc = model_data.get('test_accuracy', 0)
+            print(f"✓ Modelo SVM cargado exitosamente")
+            print(f"  Test Accuracy: {test_acc:.2%}")
+            print(f"  Clases: {len(self.svm_class_names)}")
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Error al cargar modelo: {e}")
+            return False
+
     def create_widgets(self):
-        # Barra de herramientas superior
+        # Barra superior
         self.create_top_toolbar()
 
         # Panel principal
         main_panel = ttk.Frame(self.root)
         main_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        # Panel de herramientas izquierdo (ÚNICO)
-        # Ajustamos el ancho a 300 para que no sea tan grande
+        # Panel de herramientas (notebook único)
         tools_notebook = ttk.Notebook(main_panel, width=300)
         tools_notebook.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         tools_notebook.pack_propagate(False)
 
-        # --- Pestañas originales ---
+        # Pestañas
         basic_tools_frame = ttk.Frame(tools_notebook, padding=10)
         tools_notebook.add(basic_tools_frame, text="Herramientas")
 
@@ -144,7 +184,6 @@ class PhotoEditor:
         edge_frame = ttk.Frame(tools_notebook, padding=10)
         tools_notebook.add(edge_frame, text="Detección Bordes")
 
-        # --- Pestañas de nuevas funcionalidades (añadidas al mismo notebook) ---
         otsu_frame = ttk.Frame(tools_notebook, padding=10)
         tools_notebook.add(otsu_frame, text="Otsu")
 
@@ -164,24 +203,21 @@ class PhotoEditor:
         tools_notebook.add(template_frame, text="Template")
 
         recognition_frame = ttk.Frame(tools_notebook, padding=10)
-        tools_notebook.add(recognition_frame, text="Reconocimiento")
+        tools_notebook.add(recognition_frame, text="💵 Billetes")
 
-        # --- Panel de visualización ---
+        # Panel de visualización
         self.image_frame = ttk.Frame(main_panel)
         self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Crear lienzo
         self.create_image_canvas()
 
-        # --- Llenar todas las pestañas ---
-        # Originales
+        # Llenar pestañas
         self.create_basic_tools_panel(basic_tools_frame)
         self.create_transform_panel(transform_frame)
         self.create_adjustments_panel(adjust_frame)
         self.create_filters_panel(filter_frame)
         self.create_edge_detection_panel(edge_frame)
-
-        # Nuevas
         self.create_otsu_panel(otsu_frame)
         self.create_harris_panel(harris_frame)
         self.create_skeleton_panel(skeleton_frame)
@@ -191,228 +227,336 @@ class PhotoEditor:
         self.create_recognition_panel(recognition_frame)
 
         # Barra de estado
-        self.status_bar = ttk.Label(self.root, text="PhotoEscom - Listo. Cargue una imagen para comenzar")
+        self.status_bar = ttk.Label(self.root, text="PhotoEscom - Listo")
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
+    # ============= PANEL DE RECONOCIMIENTO DE BILLETES (100% SVM) =============
+
     def create_recognition_panel(self, parent):
-        """Panel para reconocimiento de billetes"""
-        info_text = """Reconocimiento de Billetes:
+        """Panel para reconocimiento de billetes usando SVM"""
 
-Usa IA para identificar billetes mexicanos."""
+        # Título
+        title_frame = ttk.Frame(parent)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+        ttk.Label(title_frame, text="💵 Reconocimiento",
+                 font=("Arial", 12, "bold")).pack()
 
-        # Umbral de confianza ajustable
-        ttk.Label(parent, text="Umbral de Confianza:").pack(anchor=tk.W, padx=5)
-        ttk.Scale(parent, from_=0.0, to=1.0, variable=self.conf_threshold_var).pack(fill=tk.X, padx=5)
-        self.conf_label = ttk.Label(parent, text=f"{self.conf_threshold_var.get():.2f}")
-        self.conf_label.pack(pady=5)
-        self.conf_threshold_var.trace('w', self.update_conf_label)
+        # Información
+        info_text = """Reconocimiento 100% Local:
 
-        # Checkbox para preprocesar
-        ttk.Checkbutton(parent, text="Preprocesar imagen (mejorar contraste)", variable=self.preprocess_var).pack(anchor=tk.W, pady=5)
+✔ Detección con OpenCV
+✔ Descriptores personalizados
+✔ Clasificación con SVM
 
-        ttk.Button(parent, text="Reconocer Billete",
-                   command=self.apply_recognition).pack(pady=10, fill=tk.X, padx=5)
+Sin APIs externas, todo local."""
 
-        self.recognition_result_label = ttk.Label(parent, text="", wraplength=250)
-        self.recognition_result_label.pack(pady=10)
+        info_label = ttk.Label(parent, text=info_text, justify=tk.LEFT,
+                              wraplength=250, font=("Arial", 9))
+        info_label.pack(pady=10, padx=5)
 
-    def update_conf_label(self, *args):
-        self.conf_label.config(text=f"{self.conf_threshold_var.get():.2f}")
+        # Estado del modelo
+        model_frame = ttk.LabelFrame(parent, text="Estado del Modelo", padding=10)
+        model_frame.pack(fill=tk.X, pady=10, padx=5)
 
-    def apply_recognition(self):
-        """Aplicar reconocimiento de billetes MEJORADO"""
+        if self.svm_model:
+            status_text = f"✓ Modelo cargado\nClases: {len(self.svm_class_names)}"
+            status_color = "green"
+        else:
+            status_text = "✗ Modelo no disponible\nEjecuta train_bill_model.py"
+            status_color = "red"
+
+        self.model_status_label = ttk.Label(model_frame, text=status_text,
+                                           foreground=status_color)
+        self.model_status_label.pack()
+
+        ttk.Button(model_frame, text="Recargar Modelo",
+                  command=self.reload_svm_model).pack(pady=5, fill=tk.X)
+
+        # Parámetros
+        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=10)
+        params_frame.pack(fill=tk.X, pady=10, padx=5)
+
+        # Confianza mínima
+        ttk.Label(params_frame, text="Confianza Mínima:").grid(
+            row=0, column=0, sticky=tk.W, pady=5
+        )
+        ttk.Scale(params_frame, from_=0.1, to=0.95,
+                 variable=self.recognition_confidence_var).grid(
+            row=0, column=1, sticky=tk.EW, pady=5
+        )
+
+        self.conf_display = ttk.Label(params_frame,
+                                     text=f"{self.recognition_confidence_var.get():.0%}")
+        self.conf_display.grid(row=0, column=2, padx=5, pady=5)
+
+        def update_conf_display(*args):
+            self.conf_display.config(
+                text=f"{self.recognition_confidence_var.get():.0%}"
+            )
+
+        self.recognition_confidence_var.trace('w', update_conf_display)
+
+        # Opciones
+        ttk.Checkbutton(
+            params_frame,
+            text="Preprocesar imagen",
+            variable=self.preprocess_bills_var
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        ttk.Checkbutton(
+            params_frame,
+            text="Mostrar todas las detecciones",
+            variable=self.show_all_detections_var
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        params_frame.columnconfigure(1, weight=1)
+
+        # Botón principal
+        ttk.Button(parent, text="🔍 Reconocer Billetes",
+                  command=self.recognize_bills_svm).pack(pady=15, fill=tk.X, padx=5)
+
+        # Resultados
+        results_frame = ttk.LabelFrame(parent, text="Resultados", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, pady=10, padx=5)
+
+        # Scrollbar para resultados
+        result_scroll = ttk.Scrollbar(results_frame)
+        result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.recognition_result_text = tk.Text(
+            results_frame,
+            height=15,
+            width=30,
+            wrap=tk.WORD,
+            yscrollcommand=result_scroll.set,
+            font=("Courier", 9)
+        )
+        self.recognition_result_text.pack(fill=tk.BOTH, expand=True)
+        result_scroll.config(command=self.recognition_result_text.yview)
+
+        # Tags para colores
+        self.recognition_result_text.tag_config("header", font=("Arial", 10, "bold"))
+        self.recognition_result_text.tag_config("success", foreground="green")
+        self.recognition_result_text.tag_config("warning", foreground="orange")
+        self.recognition_result_text.tag_config("error", foreground="red")
+        self.recognition_result_text.tag_config("info", foreground="cyan")
+
+        # Texto inicial
+        self.recognition_result_text.insert("1.0", "Esperando imagen...\n\n", "info")
+        self.recognition_result_text.insert("end", "Carga una imagen con billetes\n")
+        self.recognition_result_text.insert("end", "y presiona 'Reconocer Billetes'")
+        self.recognition_result_text.config(state=tk.DISABLED)
+
+    def reload_svm_model(self):
+        """Recarga el modelo SVM"""
+        if self.load_svm_model():
+            messagebox.showinfo("Éxito", "Modelo recargado correctamente")
+
+            # Actualizar estado
+            status_text = f"✓ Modelo cargado\nClases: {len(self.svm_class_names)}"
+            self.model_status_label.config(text=status_text, foreground="green")
+        else:
+            messagebox.showerror("Error", "No se pudo cargar el modelo")
+
+    def update_recognition_results(self, text, tag=""):
+        """Actualiza el área de resultados"""
+        self.recognition_result_text.config(state=tk.NORMAL)
+        self.recognition_result_text.insert("end", text, tag)
+        self.recognition_result_text.config(state=tk.DISABLED)
+        self.recognition_result_text.see("end")
+        self.root.update()
+
+    def recognize_bills_svm(self):
+        """Reconocimiento de billetes usando SVM puro (sin APIs)"""
         if not self.current_image:
-            messagebox.showwarning("Advertencia", "No hay imagen")
+            messagebox.showwarning("Advertencia", "No hay imagen cargada")
+            return
+
+        if not self.svm_model:
+            messagebox.showerror("Error",
+                "Modelo SVM no disponible.\n\n"
+                "Por favor:\n"
+                "1. Ejecuta 'python train_bill_model.py'\n"
+                "2. Presiona 'Recargar Modelo'")
             return
 
         try:
-            import pickle
-            from inference_sdk import InferenceHTTPClient
+            # Limpiar resultados
+            self.recognition_result_text.config(state=tk.NORMAL)
+            self.recognition_result_text.delete("1.0", tk.END)
 
-            # Cargar modelo entrenado (opcional)
-            model_path = 'models/bill_recognizer.pkl'
-            if os.path.exists(model_path):
-                with open(model_path, 'rb') as f:
-                    model_data = pickle.load(f)
-                print(f"✓ Modelo SVM cargado (Test Acc: {model_data.get('test_accuracy', 0):.2%})")
+            self.recognition_result_text.insert("1.0", "🔍 RECONOCIENDO BILLETES\n", "header")
+            self.recognition_result_text.insert("end", "="*30 + "\n\n")
+            self.recognition_result_text.config(state=tk.DISABLED)
+            self.root.update()
+
+            # Convertir imagen
+            img_array = np.array(self.current_image)
+            img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+            print(f"\n{'='*60}")
+            print("RECONOCIMIENTO DE BILLETES - 100% SVM")
+            print(f"{'='*60}")
+            print(f"Imagen: {img_cv.shape[1]}x{img_cv.shape[0]} px")
+
+            # PASO 1: PREPROCESAMIENTO
+            if self.preprocess_bills_var.get():
+                print("\n[1/4] Preprocesando...")
+                self.update_recognition_results("\n[1/4] Preprocesando...\n", "info")
+                img_cv = self.bill_detector.preprocess_image(img_cv)
+                print("   ✓ CLAHE + Bilateral filter aplicados")
             else:
-                print("⚠️  Modelo SVM no encontrado, usando solo Roboflow")
+                print("\n[1/4] Sin preprocesamiento")
+                self.update_recognition_results("\n[1/4] Sin preprocesamiento\n", "info")
 
-            # Guardar imagen temporal
-            temp_path = os.path.abspath("temp_recognition.jpg")
+            # PASO 2: DETECCIÓN
+            print("\n[2/4] Detectando billetes...")
+            self.update_recognition_results("\n[2/4] Detectando billetes...\n", "info")
+            self.root.update()
 
-            # Asegurarse de guardar la imagen correctamente
-            try:
-                # Si la imagen actual es muy grande, redimensionar
-                img_to_save = self.current_image.copy()
-                max_size = 1920
-                if max(img_to_save.size) > max_size:
-                    ratio = max_size / max(img_to_save.size)
-                    new_size = (int(img_to_save.size[0] * ratio), int(img_to_save.size[1] * ratio))
-                    img_to_save = img_to_save.resize(new_size, Image.Resampling.LANCZOS)
-                    print(f"✓ Imagen redimensionada a {new_size}")
+            detections = self.bill_detector.detect_bills(img_cv, debug=False)
 
-                img_to_save.save(temp_path, quality=95)
-                print(f"✓ Imagen guardada en: {temp_path}")
+            print(f"   ✓ {len(detections)} objetos detectados")
+            self.update_recognition_results(f"   Detectados: {len(detections)}\n", "success")
 
-                # Verificar que se guardó
-                if not os.path.exists(temp_path):
-                    raise Exception("No se pudo guardar la imagen temporal")
-
-                file_size = os.path.getsize(temp_path) / 1024
-                print(f"✓ Tamaño: {file_size:.2f} KB")
-
-            except Exception as e:
-                messagebox.showerror("Error", f"Error al guardar imagen: {e}")
+            if len(detections) == 0:
+                print("   ⚠️  No se detectaron billetes")
+                self.update_recognition_results(
+                    "\n⚠️  No se detectaron billetes\n\n"
+                    "Sugerencias:\n"
+                    "• Mejora la iluminación\n"
+                    "• Acerca más los billetes\n"
+                    "• Activa el preprocesamiento\n"
+                    "• Verifica que sean billetes mexicanos\n",
+                    "warning"
+                )
+                self.status_bar.config(text="Sin detecciones")
                 return
 
-            # Preprocesado opcional
-            if self.preprocess_var.get():
-                img_cv = cv2.imread(temp_path)
-                lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-                img_cv = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-                cv2.imwrite(temp_path, img_cv)
-                print("✓ Preprocesamiento aplicado")
+            # PASO 3: EXTRACCIÓN Y CLASIFICACIÓN
+            print(f"\n[3/4] Clasificando con SVM...")
+            self.update_recognition_results("\n[3/4] Clasificando...\n", "info")
+            self.root.update()
 
-            # Inferencia con Roboflow
-            try:
-                CLIENT = InferenceHTTPClient(
-                    api_url="https://serverless.roboflow.com",
-                    api_key="tkhi9LqnfsZxo8AK0ULH"
+            labels = []
+            confidences = []
+            min_confidence = self.recognition_confidence_var.get()
+
+            for i, detection in enumerate(detections, 1):
+                print(f"\n   Billete #{i}:")
+
+                # Extraer región
+                x, y, w, h = detection['bbox']
+                crop = img_cv[y:y+h, x:x+w]
+
+                # Extraer descriptores
+                features, _ = extract_enhanced_descriptors(
+                    None, None, None, None, crop=crop
                 )
 
-                # Usar versión 1 que funciona mejor
-                print("🔍 Conectando con Roboflow API...")
-                result = CLIENT.infer(temp_path, model_id="billetes-mexicanos-9s5an/1")
-                print(f"✓ Respuesta recibida en {result.get('time', 0):.3f}s")
+                if features is None:
+                    print(f"      ✗ Error al extraer características")
+                    labels.append("Error")
+                    confidences.append(0.0)
+                    continue
 
-            except Exception as e:
-                messagebox.showerror("Error", f"Error con Roboflow API:\n{str(e)}")
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                return
+                # Escalar y predecir
+                features_scaled = self.svm_scaler.transform([features])
+                pred_id = self.svm_model.predict(features_scaled)[0]
+                pred_proba = self.svm_model.predict_proba(features_scaled)[0]
+                confidence = pred_proba[pred_id]
 
-            print("\n" + "=" * 60)
-            print("🔍 RESULTADOS DE DETECCIÓN")
-            print("=" * 60)
+                class_name = self.svm_class_names.get(pred_id, str(pred_id))
 
-            # Procesar resultados
-            img = cv2.imread(temp_path)
-            if img is None:
-                messagebox.showerror("Error", "No se pudo leer la imagen temporal")
-                os.remove(temp_path)
-                return
+                print(f"      Predicción: ${class_name} pesos")
+                print(f"      Confianza: {confidence:.2%}")
 
-            h_img, w_img = img.shape[:2]
-            detections = []
-
-            if 'predictions' in result and result['predictions']:
-                predictions = result['predictions']
-                conf_threshold = self.conf_threshold_var.get()
-
-                print(f"Predicciones totales: {len(predictions)}")
-                print(f"Umbral de confianza: {conf_threshold:.0%}")
-
-                for i, pred in enumerate(predictions, 1):
-                    confidence = pred['confidence']
-                    class_name = pred['class']
-
-                    print(f"\nPredicción #{i}:")
-                    print(f"  Clase: ${class_name}")
-                    print(f"  Confianza: {confidence:.2%}")
-
-                    if confidence >= conf_threshold:
-                        x, y, w, h = pred['x'], pred['y'], pred['width'], pred['height']
-                        x1 = max(0, int(x - w / 2))
-                        y1 = max(0, int(y - h / 2))
-                        x2 = min(w_img, int(x + w / 2))
-                        y2 = min(h_img, int(y + h / 2))
-
-                        # Color según confianza
-                        if confidence >= 0.7:
-                            color = (0, 255, 0)  # Verde
-                            label_bg = (0, 180, 0)
-                        elif confidence >= 0.5:
-                            color = (0, 255, 255)  # Amarillo
-                            label_bg = (0, 180, 180)
-                        else:
-                            color = (0, 165, 255)  # Naranja
-                            label_bg = (0, 120, 200)
-
-                        # Dibujar rectángulo
-                        cv2.rectangle(img, (x1, y1), (x2, y2), color, 4)
-
-                        # Preparar texto
-                        label = f"${class_name} ({confidence:.0%})"
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        font_scale = 0.9
-                        thickness = 2
-
-                        # Calcular tamaño del texto
-                        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-
-                        # Dibujar fondo del texto
-                        cv2.rectangle(img,
-                                      (x1, y1 - th - baseline - 12),
-                                      (x1 + tw + 12, y1),
-                                      label_bg, -1)
-
-                        # Dibujar borde del texto
-                        cv2.rectangle(img,
-                                      (x1, y1 - th - baseline - 12),
-                                      (x1 + tw + 12, y1),
-                                      color, 2)
-
-                        # Dibujar texto
-                        cv2.putText(img, label,
-                                    (x1 + 6, y1 - baseline - 6),
-                                    font, font_scale, (255, 255, 255), thickness)
-
-                        detections.append(f"${class_name} ({confidence:.0%})")
-                        print(f"  ✓ DETECTADO")
-                    else:
-                        print(f"  ✗ Rechazado (< {conf_threshold:.0%})")
-
-                # Actualizar interfaz
-                if detections:
-                    result_text = f"✓ Detectados:\n\n" + "\n".join(detections)
-                    self.recognition_result_label.config(text=result_text)
-                    self.status_bar.config(text=f"✓ {len(detections)} billetes detectados")
-                    print(f"\n✅ Total detectados: {len(detections)}")
+                # Verificar umbral
+                if confidence >= min_confidence or self.show_all_detections_var.get():
+                    labels.append(class_name)
+                    confidences.append(confidence)
+                    print(f"      ✓ Aceptado")
                 else:
-                    # Mostrar las mejores predicciones aunque no pasen el umbral
-                    top_preds = sorted(predictions, key=lambda p: p['confidence'], reverse=True)[:3]
-                    result_text = f"⚠️ Sin detecciones\n(umbral={conf_threshold:.0%})\n\n"
-                    result_text += "Mejores predicciones:\n"
-                    for p in top_preds:
-                        result_text += f"${p['class']}: {p['confidence']:.0%}\n"
+                    labels.append(None)
+                    confidences.append(None)
+                    print(f"      ✗ Rechazado (< {min_confidence:.0%})")
 
-                    self.recognition_result_label.config(text=result_text)
-                    self.status_bar.config(text="Baja el umbral para ver más")
-                    print(f"\n⚠️ Ninguna predicción supera {conf_threshold:.0%}")
+            # Filtrar detecciones válidas
+            valid_detections = []
+            valid_labels = []
+            valid_confidences = []
 
-                # Convertir y mostrar imagen con detecciones
-                result_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                self.current_image = result_pil
-                self.add_to_history()
-                self.display_image_on_canvas()
+            for det, lab, conf in zip(detections, labels, confidences):
+                if lab and conf:
+                    valid_detections.append(det)
+                    valid_labels.append(lab)
+                    valid_confidences.append(conf)
 
+            print(f"\n   ✓ {len(valid_detections)} billetes clasificados")
+
+            # PASO 4: VISUALIZACIÓN
+            print(f"\n[4/4] Generando visualización...")
+            self.update_recognition_results("\n[4/4] Visualizando...\n", "info")
+            self.root.update()
+
+            result_img = self.bill_detector.visualize_detections(
+                img_cv, valid_detections, valid_labels, valid_confidences
+            )
+
+            # Convertir a PIL y mostrar
+            result_pil = Image.fromarray(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+            self.current_image = result_pil
+            self.add_to_history()
+            self.display_image_on_canvas()
+
+            # Actualizar resultados finales
+            self.recognition_result_text.config(state=tk.NORMAL)
+            self.recognition_result_text.delete("1.0", tk.END)
+
+            self.recognition_result_text.insert("1.0", "✓ RECONOCIMIENTO COMPLETO\n", "header")
+            self.recognition_result_text.insert("end", "="*30 + "\n\n", "header")
+
+            if valid_detections:
+                self.recognition_result_text.insert("end",
+                    f"Billetes detectados: {len(valid_detections)}\n\n",
+                    "success")
+
+                for i, (label, conf) in enumerate(zip(valid_labels, valid_confidences), 1):
+                    tag = "success" if conf >= 0.8 else "warning" if conf >= 0.6 else "info"
+                    self.recognition_result_text.insert("end",
+                        f"#{i}: ${label} pesos\n", tag)
+                    self.recognition_result_text.insert("end",
+                        f"    Confianza: {conf:.1%}\n\n")
+
+                # Estadísticas
+                self.recognition_result_text.insert("end",
+                    "\nEstadísticas:\n", "header")
+                self.recognition_result_text.insert("end",
+                    f"• Total detectados: {len(detections)}\n")
+                self.recognition_result_text.insert("end",
+                    f"• Clasificados: {len(valid_detections)}\n")
+                avg_conf = np.mean(valid_confidences)
+                self.recognition_result_text.insert("end",
+                    f"• Confianza promedio: {avg_conf:.1%}\n")
             else:
-                result_text = "❌ No hay predicciones\n\nVerifica:\n• La imagen tiene billetes\n• Los billetes son visibles\n• Intenta preprocesar"
-                self.recognition_result_label.config(text=result_text)
-                self.status_bar.config(text="Sin predicciones")
-                print("❌ La API no devolvió predicciones")
+                self.recognition_result_text.insert("end",
+                    "⚠️  Ningún billete superó\n"
+                    f"el umbral de {min_confidence:.0%}\n\n",
+                    "warning")
+                self.recognition_result_text.insert("end",
+                    "Sugerencias:\n"
+                    "• Baja el umbral de confianza\n"
+                    "• Activa 'Mostrar todas'\n"
+                    "• Mejora la calidad de imagen\n")
 
-            # Limpiar archivo temporal
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                print(f"✓ Archivo temporal eliminado")
+            self.recognition_result_text.config(state=tk.DISABLED)
 
-            print("=" * 60 + "\n")
+            self.status_bar.config(text=f"✓ {len(valid_detections)} billetes reconocidos")
+
+            print(f"\n{'='*60}")
+            print(f"✓ PROCESO COMPLETADO")
+            print(f"{'='*60}\n")
 
         except Exception as e:
             error_msg = f"Error en reconocimiento:\n{str(e)}"
@@ -421,9 +565,7 @@ Usa IA para identificar billetes mexicanos."""
             import traceback
             traceback.print_exc()
 
-            # Limpiar
-            if os.path.exists("temp_recognition.jpg"):
-                os.remove("temp_recognition.jpg")
+    # ============= MÉTODOS DE OTSU =============
 
     def create_otsu_panel(self, parent):
         """Panel para método de Otsu"""
@@ -445,149 +587,6 @@ del fondo."""
 
         self.otsu_result_label = ttk.Label(parent, text="", wraplength=250)
         self.otsu_result_label.pack(pady=10)
-
-    def create_harris_panel(self, parent):
-        """Panel para detección de Harris"""
-        info_text = """Detección de Harris:
-
-Detecta esquinas y puntos
-de interés en la imagen."""
-
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
-
-        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
-        ttk.Radiobutton(parent, text="Manual", value="manual",
-                        variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
-                        variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
-
-        # Parámetros
-        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=5)
-        params_frame.pack(fill=tk.X, pady=5, padx=5)
-
-        ttk.Label(params_frame, text="k:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Scale(params_frame, from_=0.01, to=0.2, variable=self.harris_k_var).grid(row=0, column=1, sticky=tk.EW)
-
-        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Scale(params_frame, from_=0.001, to=0.1, variable=self.harris_threshold_var).grid(row=1, column=1, sticky=tk.EW)
-
-        params_frame.columnconfigure(1, weight=1)
-
-        ttk.Button(parent, text="Detectar Esquinas",
-                   command=self.apply_harris).pack(pady=10, fill=tk.X, padx=5)
-
-        self.harris_result_label = ttk.Label(parent, text="", wraplength=250)
-        self.harris_result_label.pack(pady=10)
-
-    def create_skeleton_panel(self, parent):
-        """Panel para esqueletonización"""
-        info_text = """Esqueletonización:
-
-Reduce objetos a 1 píxel
-de ancho."""
-
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
-
-        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
-        ttk.Radiobutton(parent, text="Morfológico OpenCV", value="opencv",
-                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="Morfológico Manual", value="manual",
-                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="Zhang-Suen", value="zhang_suen",
-                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
-
-        ttk.Button(parent, text="Aplicar",
-                   command=self.apply_skeletonization).pack(pady=10, fill=tk.X, padx=5)
-
-        self.skeleton_result_label = ttk.Label(parent, text="", wraplength=250)
-        self.skeleton_result_label.pack(pady=10)
-
-    def create_perimeter_panel(self, parent):
-        """Panel para análisis de perímetro"""
-        info_text = """Análisis de Perímetro:
-
-Mide contornos de objetos."""
-
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
-
-        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
-        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
-                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="Chain Code", value="chain_code",
-                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="Morfológico", value="morphological",
-                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
-
-        ttk.Button(parent, text="Analizar",
-                   command=self.apply_perimeter_analysis).pack(pady=10, fill=tk.X, padx=5)
-
-        self.perimeter_result_text = tk.Text(parent, height=10, width=30)
-        self.perimeter_result_text.pack(pady=10, padx=5)
-
-    def create_segmentation_panel(self, parent):
-        """Panel para segmentación"""
-        info_text = """Segmentación:
-
-Divide la imagen en regiones."""
-
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
-
-        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
-        ttk.Radiobutton(parent, text="Threshold", value="threshold",
-                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="K-means", value="kmeans",
-                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="Watershed", value="watershed",
-                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
-
-        # Parámetros
-        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=5)
-        params_frame.pack(fill=tk.X, pady=5, padx=5)
-
-        ttk.Label(params_frame, text="Clusters:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Scale(params_frame, from_=2, to=10,
-                  variable=self.seg_clusters_var).grid(row=0, column=1, sticky=tk.EW)
-
-        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Scale(params_frame, from_=0, to=255,
-                  variable=self.seg_threshold_var).grid(row=1, column=1, sticky=tk.EW)
-
-        params_frame.columnconfigure(1, weight=1)
-
-        ttk.Button(parent, text="Aplicar",
-                   command=self.apply_segmentation).pack(pady=10, fill=tk.X, padx=5)
-
-        self.seg_result_label = ttk.Label(parent, text="", wraplength=250)
-        self.seg_result_label.pack(pady=10)
-
-    def create_template_panel(self, parent):
-        """Panel para template matching"""
-        info_text = """Template Matching:
-
-Busca una plantilla en
-la imagen."""
-
-        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
-
-        ttk.Button(parent, text="📁 Cargar Template",
-                   command=self.load_template).pack(pady=5, fill=tk.X, padx=5)
-
-        self.template_status = ttk.Label(parent, text="No hay template", wraplength=250)
-        self.template_status.pack(pady=5)
-
-        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
-        ttk.Radiobutton(parent, text="Manual", value="manual",
-                        variable=self.template_method_var).pack(anchor=tk.W, padx=20)
-        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
-                        variable=self.template_method_var).pack(anchor=tk.W, padx=20)
-
-        ttk.Button(parent, text="Buscar Template",
-                   command=self.apply_template_matching).pack(pady=10, fill=tk.X, padx=5)
-
-        self.template_result_label = ttk.Label(parent, text="", wraplength=250)
-        self.template_result_label.pack(pady=10)
-
-    # ========== MÉTODOS DE APLICACIÓN ==========
 
     def apply_otsu_manual(self):
         """Aplicar Otsu manual"""
@@ -629,6 +628,41 @@ la imagen."""
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    # ============= MÉTODOS DE HARRIS =============
+
+    def create_harris_panel(self, parent):
+        """Panel para detección de Harris"""
+        info_text = """Detección de Harris:
+
+Detecta esquinas y puntos
+de interés en la imagen."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
+        ttk.Radiobutton(parent, text="Manual", value="manual",
+                        variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
+                        variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
+
+        # Parámetros
+        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=5)
+        params_frame.pack(fill=tk.X, pady=5, padx=5)
+
+        ttk.Label(params_frame, text="k:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0.01, to=0.2, variable=self.harris_k_var).grid(row=0, column=1, sticky=tk.EW)
+
+        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0.001, to=0.1, variable=self.harris_threshold_var).grid(row=1, column=1, sticky=tk.EW)
+
+        params_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(parent, text="Detectar Esquinas",
+                   command=self.apply_harris).pack(pady=10, fill=tk.X, padx=5)
+
+        self.harris_result_label = ttk.Label(parent, text="", wraplength=250)
+        self.harris_result_label.pack(pady=10)
+
     def apply_harris(self):
         """Aplicar Harris"""
         if not self.current_image:
@@ -660,6 +694,31 @@ la imagen."""
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    # ============= MÉTODOS DE ESQUELETONIZACIÓN =============
+
+    def create_skeleton_panel(self, parent):
+        """Panel para esqueletonización"""
+        info_text = """Esqueletonización:
+
+Reduce objetos a 1 píxel
+de ancho."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
+        ttk.Radiobutton(parent, text="Morfológico OpenCV", value="opencv",
+                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="Morfológico Manual", value="manual",
+                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="Zhang-Suen", value="zhang_suen",
+                        variable=self.skeleton_method_var).pack(anchor=tk.W, padx=20)
+
+        ttk.Button(parent, text="Aplicar",
+                   command=self.apply_skeletonization).pack(pady=10, fill=tk.X, padx=5)
+
+        self.skeleton_result_label = ttk.Label(parent, text="", wraplength=250)
+        self.skeleton_result_label.pack(pady=10)
+
     def apply_skeletonization(self):
         """Aplicar esqueletonización"""
         if not self.current_image:
@@ -687,6 +746,30 @@ la imagen."""
             self.status_bar.config(text=f"Esqueleto ({method})")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # ============= MÉTODOS DE PERÍMETRO =============
+
+    def create_perimeter_panel(self, parent):
+        """Panel para análisis de perímetro"""
+        info_text = """Análisis de Perímetro:
+
+Mide contornos de objetos."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
+        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
+                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="Chain Code", value="chain_code",
+                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="Morfológico", value="morphological",
+                        variable=self.perimeter_method_var).pack(anchor=tk.W, padx=20)
+
+        ttk.Button(parent, text="Analizar",
+                   command=self.apply_perimeter_analysis).pack(pady=10, fill=tk.X, padx=5)
+
+        self.perimeter_result_text = tk.Text(parent, height=10, width=30)
+        self.perimeter_result_text.pack(pady=10, padx=5)
 
     def apply_perimeter_analysis(self):
         """Aplicar análisis de perímetro"""
@@ -722,6 +805,44 @@ la imagen."""
             self.status_bar.config(text=f"Perímetro ({method})")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # ============= MÉTODOS DE SEGMENTACIÓN =============
+
+    def create_segmentation_panel(self, parent):
+        """Panel para segmentación"""
+        info_text = """Segmentación:
+
+Divide la imagen en regiones."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
+        ttk.Radiobutton(parent, text="Threshold", value="threshold",
+                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="K-means", value="kmeans",
+                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="Watershed", value="watershed",
+                        variable=self.seg_method_var).pack(anchor=tk.W, padx=20)
+
+        # Parámetros
+        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=5)
+        params_frame.pack(fill=tk.X, pady=5, padx=5)
+
+        ttk.Label(params_frame, text="Clusters:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=2, to=10,
+                  variable=self.seg_clusters_var).grid(row=0, column=1, sticky=tk.EW)
+
+        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0, to=255,
+                  variable=self.seg_threshold_var).grid(row=1, column=1, sticky=tk.EW)
+
+        params_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(parent, text="Aplicar",
+                   command=self.apply_segmentation).pack(pady=10, fill=tk.X, padx=5)
+
+        self.seg_result_label = ttk.Label(parent, text="", wraplength=250)
+        self.seg_result_label.pack(pady=10)
 
     def apply_segmentation(self):
         """Aplicar segmentación"""
@@ -761,6 +882,35 @@ la imagen."""
             self.status_bar.config(text=f"Segmentación ({method})")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # ============= MÉTODOS DE TEMPLATE MATCHING =============
+
+    def create_template_panel(self, parent):
+        """Panel para template matching"""
+        info_text = """Template Matching:
+
+Busca una plantilla en
+la imagen."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        ttk.Button(parent, text="📁 Cargar Template",
+                   command=self.load_template).pack(pady=5, fill=tk.X, padx=5)
+
+        self.template_status = ttk.Label(parent, text="No hay template", wraplength=250)
+        self.template_status.pack(pady=5)
+
+        ttk.Label(parent, text="Método:").pack(anchor=tk.W, padx=5)
+        ttk.Radiobutton(parent, text="Manual", value="manual",
+                        variable=self.template_method_var).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(parent, text="OpenCV", value="opencv",
+                        variable=self.template_method_var).pack(anchor=tk.W, padx=20)
+
+        ttk.Button(parent, text="Buscar Template",
+                   command=self.apply_template_matching).pack(pady=10, fill=tk.X, padx=5)
+
+        self.template_result_label = ttk.Label(parent, text="", wraplength=250)
+        self.template_result_label.pack(pady=10)
 
     def load_template(self):
         """Cargar template"""
@@ -813,381 +963,7 @@ la imagen."""
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    # ============= MÉTODOS DE DETECCIÓN DE BORDES SEGÚN PDF =============
-    # (Todo tu código original de detección de bordes aquí...)
-
-    def normalize_image(self, image):
-        """Normalizar imagen a rango [0, 255] usando min-max normalization"""
-        if image.dtype != np.float64:
-            image = image.astype(np.float64)
-
-        min_val = np.min(image)
-        max_val = np.max(image)
-
-        if max_val == min_val:
-            return np.zeros_like(image, dtype=np.uint8)
-
-        normalized = (image - min_val) / (max_val - min_val)
-        return (normalized * 255).astype(np.uint8)
-
-    def gradient_operator(self, image_array):
-        """Gradiente básico - Diferencias finitas"""
-        grad_x = np.zeros_like(image_array, dtype=np.float64)
-        grad_y = np.zeros_like(image_array, dtype=np.float64)
-
-        grad_x[:, 1:-1] = (image_array[:, 2:] - image_array[:, :-2]) / 2.0
-        grad_y[1:-1, :] = (image_array[2:, :] - image_array[:-2, :]) / 2.0
-
-        grad_x[:, 0] = image_array[:, 1] - image_array[:, 0]
-        grad_x[:, -1] = image_array[:, -1] - image_array[:, -2]
-        grad_y[0, :] = image_array[1, :] - image_array[0, :]
-        grad_y[-1, :] = image_array[-1, :] - image_array[-2, :]
-
-        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        angle = np.arctan2(grad_y, grad_x)
-
-        return magnitude, angle, grad_x, grad_y
-
-    def sobel_operator(self, image_array):
-        """Operador de Sobel"""
-        gx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
-        gy = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64)
-
-        grad_x = ndimage.convolve(image_array.astype(np.float64), gx)
-        grad_y = ndimage.convolve(image_array.astype(np.float64), gy)
-
-        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        angle = np.arctan2(grad_y, grad_x)
-
-        return magnitude, angle, grad_x, grad_y
-
-    def prewitt_operator(self, image_array):
-        """Operador de Prewitt"""
-        gx = np.array([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]], dtype=np.float64)
-        gy = np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]], dtype=np.float64)
-
-        grad_x = ndimage.convolve(image_array.astype(np.float64), gx)
-        grad_y = ndimage.convolve(image_array.astype(np.float64), gy)
-
-        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        angle = np.arctan2(grad_y, grad_x)
-
-        return magnitude, angle, grad_x, grad_y
-
-    def roberts_operator(self, image_array):
-        """Operador de Roberts"""
-        h, w = image_array.shape
-        grad_x = np.zeros_like(image_array, dtype=np.float64)
-        grad_y = np.zeros_like(image_array, dtype=np.float64)
-
-        grad_x[1:, 1:] = image_array[1:, 1:] - image_array[:-1, :-1]
-        grad_y[1:, :-1] = image_array[1:, :-1] - image_array[:-1, 1:]
-
-        if self.roberts_form_var.get() == "sqrt":
-            magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        else:
-            magnitude = np.abs(grad_x) + np.abs(grad_y)
-
-        angle = np.arctan2(grad_y, grad_x)
-        return magnitude, angle, grad_x, grad_y
-
-    def kirsch_operator(self, image_array):
-        """Máscaras de Kirsch"""
-        masks = [
-            np.array([[-3, -3, 5], [-3, 0, 5], [-3, -3, 5]], dtype=np.float64),
-            np.array([[-3, 5, 5], [-3, 0, 5], [-3, -3, -3]], dtype=np.float64),
-            np.array([[5, 5, 5], [-3, 0, -3], [-3, -3, -3]], dtype=np.float64),
-            np.array([[5, 5, -3], [5, 0, -3], [-3, -3, -3]], dtype=np.float64),
-            np.array([[5, -3, -3], [5, 0, -3], [5, -3, -3]], dtype=np.float64),
-            np.array([[-3, -3, -3], [5, 0, -3], [5, 5, -3]], dtype=np.float64),
-            np.array([[-3, -3, -3], [-3, 0, -3], [5, 5, 5]], dtype=np.float64),
-            np.array([[-3, -3, -3], [-3, 0, 5], [-3, 5, 5]], dtype=np.float64)
-        ]
-
-        responses = [ndimage.convolve(image_array.astype(np.float64), mask) for mask in masks]
-        magnitude = np.maximum.reduce(responses)
-        responses_stack = np.stack(responses, axis=-1)
-        angle_indices = np.argmax(responses_stack, axis=-1)
-        angle = angle_indices * 45.0
-
-        return magnitude, np.deg2rad(angle), None, None
-
-    def robinson_operator(self, image_array):
-        """Máscaras de Robinson"""
-        masks = [
-            np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64),
-            np.array([[0, 1, 2], [-1, 0, 1], [-2, -1, 0]], dtype=np.float64),
-            np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64),
-            np.array([[2, 1, 0], [1, 0, -1], [0, -1, -2]], dtype=np.float64),
-            np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float64),
-            np.array([[0, -1, -2], [1, 0, -1], [2, 1, 0]], dtype=np.float64),
-            np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64),
-            np.array([[-2, -1, 0], [-1, 0, 1], [0, 1, 2]], dtype=np.float64)
-        ]
-
-        responses = [ndimage.convolve(image_array.astype(np.float64), mask) for mask in masks]
-        magnitude = np.maximum.reduce(responses)
-        responses_stack = np.stack(responses, axis=-1)
-        angle_indices = np.argmax(responses_stack, axis=-1)
-        angle = angle_indices * 45.0
-
-        return magnitude, np.deg2rad(angle), None, None
-
-    def frei_chen_operator(self, image_array):
-        """Máscaras de Frei-Chen"""
-        sqrt2 = np.sqrt(2)
-        masks = [
-            (1 / (2 * sqrt2)) * np.array([[1, sqrt2, 1], [0, 0, 0], [-1, -sqrt2, -1]], dtype=np.float64),
-            (1 / (2 * sqrt2)) * np.array([[1, 0, -1], [sqrt2, 0, -sqrt2], [1, 0, -1]], dtype=np.float64),
-            (1 / (2 * sqrt2)) * np.array([[0, -1, sqrt2], [1, 0, -1], [-sqrt2, 1, 0]], dtype=np.float64),
-            (1 / (2 * sqrt2)) * np.array([[sqrt2, -1, 0], [-1, 0, 1], [0, 1, -sqrt2]], dtype=np.float64),
-            0.5 * np.array([[0, 1, 0], [-1, 0, -1], [0, 1, 0]], dtype=np.float64),
-            0.5 * np.array([[-1, 0, 1], [0, 0, 0], [1, 0, -1]], dtype=np.float64),
-            (1 / 6) * np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float64),
-            (1 / 6) * np.array([[-2, 1, -2], [1, 4, 1], [-2, 1, -2]], dtype=np.float64),
-            (1 / 3) * np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=np.float64)
-        ]
-
-        projections = [ndimage.convolve(image_array.astype(np.float64), mask) for mask in masks]
-        edge_responses = [p ** 2 for p in projections[:4]]
-        all_responses = [p ** 2 for p in projections]
-
-        M = np.sum(edge_responses, axis=0)
-        S = np.sum(all_responses, axis=0)
-        S_safe = np.where(S > 0, S, 1)
-        cos_theta = np.sqrt(np.clip(M / S_safe, 0, 1))
-        magnitude = np.sqrt(M)
-
-        return magnitude, cos_theta, None, None
-
-    def extended_sobel_operator(self, image_array, size=7):
-        """Operador de Sobel Extendido"""
-        if size == 3:
-            return self.sobel_operator(image_array)
-
-        if size == 5:
-            gx = np.array([[-1, -2, 0, 2, 1], [-2, -3, 0, 3, 2], [-3, -5, 0, 5, 3],
-                           [-2, -3, 0, 3, 2], [-1, -2, 0, 2, 1]], dtype=np.float64)
-        elif size == 7:
-            gx = np.array([[-1, -1, -1, 0, 1, 1, 1], [-1, -2, -2, 0, 2, 2, 1],
-                           [-1, -2, -3, 0, 3, 2, 1], [-1, -2, -3, 0, 3, 2, 1],
-                           [-1, -2, -3, 0, 3, 2, 1], [-1, -2, -2, 0, 2, 2, 1],
-                           [-1, -1, -1, 0, 1, 1, 1]], dtype=np.float64)
-        else:
-            return self.sobel_operator(image_array)
-
-        gy = gx.T
-        grad_x = ndimage.convolve(image_array.astype(np.float64), gx)
-        grad_y = ndimage.convolve(image_array.astype(np.float64), gy)
-        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        angle = np.arctan2(grad_y, grad_x)
-
-        return magnitude, angle, grad_x, grad_y
-
-    def canny_operator(self, image_array):
-        """Algoritmo de Canny"""
-        try:
-            img_uint8 = image_array.astype(np.uint8)
-            sigma = self.sigma_var.get()
-            ksize = int(2 * np.ceil(2 * sigma) + 1)
-            if ksize % 2 == 0:
-                ksize += 1
-            blurred = cv2.GaussianBlur(img_uint8, (ksize, ksize), sigma)
-            low_threshold = int(self.canny_low_var.get())
-            high_threshold = int(self.canny_high_var.get())
-            edges = cv2.Canny(blurred, low_threshold, high_threshold)
-            return edges, None, None, None
-        except:
-            return self.canny_manual(image_array)
-
-    def canny_manual(self, image_array):
-        """Implementación manual de Canny"""
-        sigma = self.sigma_var.get()
-        smoothed = gaussian_filter(image_array.astype(np.float64), sigma=sigma)
-        magnitude, angle, grad_x, grad_y = self.sobel_operator(smoothed)
-        suppressed = self.non_maximum_suppression(magnitude, angle)
-        low_threshold = self.canny_low_var.get()
-        high_threshold = self.canny_high_var.get()
-        edges = self.hysteresis_threshold(suppressed, low_threshold, high_threshold)
-        return (edges * 255).astype(np.uint8), angle, grad_x, grad_y
-
-    def non_maximum_suppression(self, magnitude, angle):
-        """Supresión no máxima"""
-        rows, cols = magnitude.shape
-        suppressed = np.zeros_like(magnitude)
-        angle_deg = (np.rad2deg(angle) + 180) % 180
-
-        for i in range(1, rows - 1):
-            for j in range(1, cols - 1):
-                current = magnitude[i, j]
-                ang = angle_deg[i, j]
-
-                if (ang >= 0 and ang < 22.5) or (ang >= 157.5 and ang < 180):
-                    neighbors = [magnitude[i, j - 1], magnitude[i, j + 1]]
-                elif ang >= 22.5 and ang < 67.5:
-                    neighbors = [magnitude[i - 1, j + 1], magnitude[i + 1, j - 1]]
-                elif ang >= 67.5 and ang < 112.5:
-                    neighbors = [magnitude[i - 1, j], magnitude[i + 1, j]]
-                else:
-                    neighbors = [magnitude[i - 1, j - 1], magnitude[i + 1, j + 1]]
-
-                if current >= max(neighbors):
-                    suppressed[i, j] = current
-
-        return suppressed
-
-    def hysteresis_threshold(self, image, low_threshold, high_threshold):
-        """Histéresis de umbral"""
-        strong_edges = image > high_threshold
-        weak_edges = (image >= low_threshold) & (image <= high_threshold)
-        strong_dilated = binary_dilation(strong_edges, structure=np.ones((3, 3)))
-        connected_weak = weak_edges & strong_dilated
-        edges = strong_edges | connected_weak
-        return edges.astype(np.float32)
-
-    def laplacian_operator(self, image_array):
-        """Laplaciano de la Gaussiana"""
-        sigma = self.sigma_var.get()
-        smoothed = gaussian_filter(image_array.astype(np.float64), sigma=sigma)
-        laplacian = ndimage.laplace(smoothed)
-        zero_crossings = self.detect_zero_crossings(laplacian)
-        return zero_crossings, None, None, None
-
-    def detect_zero_crossings(self, laplacian):
-        """Detectar zero-crossings"""
-        zc = np.zeros_like(laplacian, dtype=np.uint8)
-        for dx, dy in [(0, 1), (1, 0), (1, 1), (1, -1)]:
-            rolled = np.roll(np.roll(laplacian, dx, axis=0), dy, axis=1)
-            zc |= ((laplacian * rolled) < 0).astype(np.uint8)
-        return zc * 255
-
-    def apply_edge_detection(self):
-        """Aplicar detección de bordes"""
-        if not self.current_image:
-            messagebox.showwarning("Advertencia", "No hay imagen cargada")
-            return
-
-        try:
-            gray_image = self.history[self.history_index].convert('L')
-            image_array = np.array(gray_image, dtype=np.float32)
-            operator = self.edge_operator_var.get()
-            size = self.extended_size_var.get()
-
-            if operator == "gradient":
-                magnitude, angle, grad_x, grad_y = self.gradient_operator(image_array)
-            elif operator == "sobel":
-                if size > 3:
-                    magnitude, angle, grad_x, grad_y = self.extended_sobel_operator(image_array, size)
-                else:
-                    magnitude, angle, grad_x, grad_y = self.sobel_operator(image_array)
-            elif operator == "prewitt":
-                magnitude, angle, grad_x, grad_y = self.prewitt_operator(image_array)
-            elif operator == "roberts":
-                magnitude, angle, grad_x, grad_y = self.roberts_operator(image_array)
-            elif operator == "kirsch":
-                magnitude, angle, _, _ = self.kirsch_operator(image_array)
-            elif operator == "robinson":
-                magnitude, angle, _, _ = self.robinson_operator(image_array)
-            elif operator == "frei_chen":
-                magnitude, cos_theta, _, _ = self.frei_chen_operator(image_array)
-                angle = np.arccos(np.clip(cos_theta, 0, 1))
-            elif operator == "canny":
-                result, angle, grad_x, grad_y = self.canny_operator(image_array)
-                edge_image = Image.fromarray(result).convert('RGB')
-                self.current_image = edge_image
-                self.add_to_history()
-                self.display_image_on_canvas()
-                self.status_bar.config(text=f"PhotoEscom - Operador {operator} aplicado")
-                return
-            elif operator == "laplacian":
-                result, _, _, _ = self.laplacian_operator(image_array)
-                edge_image = Image.fromarray(result).convert('RGB')
-                self.current_image = edge_image
-                self.add_to_history()
-                self.display_image_on_canvas()
-                self.status_bar.config(text=f"PhotoEscom - Laplaciano aplicado")
-                return
-            else:
-                messagebox.showerror("Error", f"Operador no reconocido: {operator}")
-                return
-
-            if self.show_magnitude_var.get():
-                result = self.normalize_image(magnitude)
-            elif self.show_angle_var.get() and angle is not None:
-                angle_normalized = ((angle + np.pi) / (2 * np.pi) * 255).astype(np.uint8)
-                result = angle_normalized
-            else:
-                threshold = self.threshold_var.get()
-                magnitude_norm = self.normalize_image(magnitude)
-                result = np.where(magnitude_norm > threshold, 255, 0).astype(np.uint8)
-
-            edge_image = Image.fromarray(result).convert('RGB')
-            self.current_image = edge_image
-            self.add_to_history()
-            self.display_image_on_canvas()
-            self.status_bar.config(text=f"PhotoEscom - Operador {operator} aplicado")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Error: {str(e)}")
-
-    def preview_edge_detection(self):
-        """Vista previa rápida"""
-        if not self.current_image:
-            return
-
-        try:
-            original_img = self.history[self.history_index]
-            if max(original_img.size) > 800:
-                ratio = 800 / max(original_img.size)
-                new_size = (int(original_img.size[0] * ratio), int(original_img.size[1] * ratio))
-                preview_img = original_img.resize(new_size, Image.Resampling.LANCZOS)
-            else:
-                preview_img = original_img
-
-            gray_image = preview_img.convert('L')
-            image_array = np.array(gray_image, dtype=np.float32)
-            operator = self.edge_operator_var.get()
-
-            if operator == "canny":
-                result, _, _, _ = self.canny_operator(image_array)
-            else:
-                if operator == "sobel":
-                    magnitude, _, _, _ = self.sobel_operator(image_array)
-                elif operator == "prewitt":
-                    magnitude, _, _, _ = self.prewitt_operator(image_array)
-                elif operator == "roberts":
-                    magnitude, _, _, _ = self.roberts_operator(image_array)
-                elif operator == "gradient":
-                    magnitude, _, _, _ = self.gradient_operator(image_array)
-                elif operator == "kirsch":
-                    magnitude, _, _, _ = self.kirsch_operator(image_array)
-                elif operator == "robinson":
-                    magnitude, _, _, _ = self.robinson_operator(image_array)
-                elif operator == "frei_chen":
-                    magnitude, _, _, _ = self.frei_chen_operator(image_array)
-                elif operator == "laplacian":
-                    result, _, _, _ = self.laplacian_operator(image_array)
-                    magnitude = None
-                else:
-                    return
-
-                if magnitude is not None:
-                    threshold = self.threshold_var.get()
-                    magnitude_norm = self.normalize_image(magnitude)
-                    result = np.where(magnitude_norm > threshold, 255, 0).astype(np.uint8)
-
-            if max(original_img.size) > 800:
-                result_pil = Image.fromarray(result)
-                result_pil = result_pil.resize(original_img.size, Image.Resampling.NEAREST)
-                result = np.array(result_pil)
-
-            edge_image = Image.fromarray(result).convert('RGB')
-            self.current_image = edge_image
-            self.display_image_on_canvas()
-            self.status_bar.config(text=f"PhotoEscom - Vista previa: {operator}")
-
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    # ============= MÉTODOS DE DETECCIÓN DE BORDES =============
 
     def create_edge_detection_panel(self, parent):
         """Panel de detección de bordes"""
@@ -1268,19 +1044,6 @@ la imagen."""
         canny_high_value = ttk.Label(params_frame, text="150", width=5)
         canny_high_value.grid(row=3, column=2, padx=(5, 0), pady=5)
 
-        ttk.Label(params_frame, text="Roberts Form:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        ttk.Radiobutton(params_frame, text="Sqrt", value="sqrt", variable=self.roberts_form_var).grid(row=4, column=1, sticky=tk.W)
-        ttk.Radiobutton(params_frame, text="Abs", value="abs", variable=self.roberts_form_var).grid(row=4, column=2, sticky=tk.W)
-
-        ttk.Checkbutton(params_frame, text="Mostrar Magnitud", variable=self.show_magnitude_var).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=5)
-
-        ttk.Checkbutton(params_frame, text="Mostrar Ángulo", variable=self.show_angle_var).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=5)
-
-        ttk.Label(params_frame, text="Sobel Extendido:").grid(row=7, column=0, sticky=tk.W, pady=5)
-        ttk.Radiobutton(params_frame, text="3x3", value=3, variable=self.extended_size_var).grid(row=7, column=1, sticky=tk.W)
-        ttk.Radiobutton(params_frame, text="5x5", value=5, variable=self.extended_size_var).grid(row=7, column=2, sticky=tk.W)
-        ttk.Radiobutton(params_frame, text="7x7", value=7, variable=self.extended_size_var).grid(row=8, column=1, sticky=tk.W)
-
         params_frame.columnconfigure(1, weight=1)
 
         # Botones
@@ -1303,22 +1066,91 @@ la imagen."""
         self.canny_low_var.trace('w', update_param_values)
         self.canny_high_var.trace('w', update_param_values)
 
-    def update_operator_info(self, *args):
-        """Actualizar información del operador"""
-        operator = self.edge_operator_var.get()
-        info_texts = {
-            "gradient": "Gradiente Básico",
-            "sobel": "Sobel",
-            "prewitt": "Prewitt",
-            "roberts": "Roberts",
-            "kirsch": "Kirsch",
-            "robinson": "Robinson",
-            "frei_chen": "Frei-Chen",
-            "canny": "Canny",
-            "laplacian": "Laplaciano"
-        }
-        if hasattr(self, 'operator_info'):
-            self.operator_info.config(text=info_texts.get(operator, ""))
+    def normalize_image(self, image):
+        """Normalizar imagen a rango [0, 255]"""
+        if image.dtype != np.float64:
+            image = image.astype(np.float64)
+
+        min_val = np.min(image)
+        max_val = np.max(image)
+
+        if max_val == min_val:
+            return np.zeros_like(image, dtype=np.uint8)
+
+        normalized = (image - min_val) / (max_val - min_val)
+        return (normalized * 255).astype(np.uint8)
+
+    def sobel_operator(self, image_array):
+        """Operador de Sobel"""
+        gx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+        gy = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64)
+
+        grad_x = ndimage.convolve(image_array.astype(np.float64), gx)
+        grad_y = ndimage.convolve(image_array.astype(np.float64), gy)
+
+        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        angle = np.arctan2(grad_y, grad_x)
+
+        return magnitude, angle, grad_x, grad_y
+
+    def canny_operator(self, image_array):
+        """Algoritmo de Canny"""
+        try:
+            img_uint8 = image_array.astype(np.uint8)
+            sigma = self.sigma_var.get()
+            ksize = int(2 * np.ceil(2 * sigma) + 1)
+            if ksize % 2 == 0:
+                ksize += 1
+            blurred = cv2.GaussianBlur(img_uint8, (ksize, ksize), sigma)
+            low_threshold = int(self.canny_low_var.get())
+            high_threshold = int(self.canny_high_var.get())
+            edges = cv2.Canny(blurred, low_threshold, high_threshold)
+            return edges, None, None, None
+        except:
+            return image_array, None, None, None
+
+    def apply_edge_detection(self):
+        """Aplicar detección de bordes"""
+        if not self.current_image:
+            messagebox.showwarning("Advertencia", "No hay imagen cargada")
+            return
+
+        try:
+            gray_image = self.history[self.history_index].convert('L')
+            image_array = np.array(gray_image, dtype=np.float32)
+            operator = self.edge_operator_var.get()
+
+            if operator == "sobel":
+                magnitude, angle, grad_x, grad_y = self.sobel_operator(image_array)
+            elif operator == "canny":
+                result, angle, grad_x, grad_y = self.canny_operator(image_array)
+                edge_image = Image.fromarray(result).convert('RGB')
+                self.current_image = edge_image
+                self.add_to_history()
+                self.display_image_on_canvas()
+                self.status_bar.config(text=f"PhotoEscom - Operador {operator} aplicado")
+                return
+            else:
+                magnitude, angle, grad_x, grad_y = self.sobel_operator(image_array)
+
+            threshold = self.threshold_var.get()
+            magnitude_norm = self.normalize_image(magnitude)
+            result = np.where(magnitude_norm > threshold, 255, 0).astype(np.uint8)
+
+            edge_image = Image.fromarray(result).convert('RGB')
+            self.current_image = edge_image
+            self.add_to_history()
+            self.display_image_on_canvas()
+            self.status_bar.config(text=f"PhotoEscom - Operador {operator} aplicado")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error: {str(e)}")
+
+    def preview_edge_detection(self):
+        """Vista previa rápida"""
+        self.apply_edge_detection()
+
+    # ============= HERRAMIENTAS BÁSICAS =============
 
     def create_top_toolbar(self):
         """Barra de herramientas superior"""
@@ -1647,6 +1479,8 @@ la imagen."""
             img = Image.fromarray(img_array)
         elif filter_type == "blur":
             img = img.filter(ImageFilter.BLUR)
+        elif filter_type == "detail":
+            img = img.filter(ImageFilter.DETAIL)
         self.current_image = img
         self.display_image_on_canvas()
         if filter_type != "original":
@@ -1665,7 +1499,7 @@ la imagen."""
             self.display_image_on_canvas()
 
     def zoom_fit(self):
-        """Ajustar zoom para que la imagen se vea completa en el lienzo."""
+        """Ajustar zoom"""
         if not self.current_image:
             return
 
@@ -1693,7 +1527,6 @@ la imagen."""
             self.zoom_factor = 0.1
 
         self.display_image_on_canvas()
-        self.status_bar.config(text=f"PhotoEscom - Zoom ajustado al lienzo ({self.zoom_factor:.2f})")
 
     def on_container_configure(self, event):
         """Evento de configuración de contenedor"""

@@ -1,3 +1,8 @@
+"""
+ENTRENAMIENTO DEL MODELO SVM PARA RECONOCIMIENTO DE BILLETES
+Sin Roboflow - 100% Local
+"""
+
 import cv2
 import numpy as np
 import os
@@ -9,7 +14,15 @@ import yaml
 
 
 def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, img_height=None, crop=None):
-    """Extrae descriptores mejorados con más características"""
+    """
+    Extrae descriptores mejorados de región y perímetro
+
+    Descriptores extraídos:
+    - Geométricos: área, perímetro, compacidad, aspect ratio, etc.
+    - Momentos: momentos de Hu (7)
+    - Color: histogramas HSV + estadísticas
+    - Textura: gradientes Sobel
+    """
     class_id = None
 
     if crop is not None:
@@ -71,7 +84,7 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
 
     contour = max(contours, key=cv2.contourArea)
 
-    # Características geométricas
+    # === DESCRIPTORES GEOMÉTRICOS ===
     area = cv2.contourArea(contour)
     if area == 0:
         return None, None
@@ -92,7 +105,7 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
     hull_perimeter = cv2.arcLength(hull, True)
     convexity = hull_perimeter / perimeter if perimeter > 0 else 0
 
-    # Momentos
+    # === MOMENTOS ===
     moments = cv2.moments(contour)
     hu_moments = cv2.HuMoments(moments).flatten()
     hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
@@ -100,7 +113,7 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
     mu20 = moments['mu20'] / (moments['m00'] ** 2) if moments['m00'] > 0 else 0
     mu02 = moments['mu02'] / (moments['m00'] ** 2) if moments['m00'] > 0 else 0
 
-    # Color en HSV
+    # === COLOR EN HSV ===
     img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = np.zeros(gray.shape, dtype=np.uint8)
     cv2.drawContours(mask, [contour], -1, 255, -1)
@@ -117,7 +130,7 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
     mean_s, std_s = cv2.meanStdDev(img_hsv[:, :, 1], mask=mask)
     mean_v, std_v = cv2.meanStdDev(img_hsv[:, :, 2], mask=mask)
 
-    # Textura
+    # === TEXTURA ===
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     gradient_magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
@@ -125,12 +138,13 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
     mean_texture = np.mean(gradient_magnitude[mask > 0])
     std_texture = np.std(gradient_magnitude[mask > 0])
 
+    # === VECTOR DE CARACTERÍSTICAS ===
     features = np.array([
         area, perimeter, compactness, aspect_ratio, eccentricity,
         extent, solidity, convexity, mu20, mu02,
-        *hu_moments,
+        *hu_moments,  # 7 momentos de Hu
         mean_h[0][0], std_h[0][0], mean_s[0][0], std_s[0][0], mean_v[0][0], std_v[0][0],
-        *hist_h, *hist_s, *hist_v,
+        *hist_h, *hist_s, *hist_v,  # 24 bins de histograma
         mean_texture, std_texture
     ])
 
@@ -138,7 +152,7 @@ def extract_enhanced_descriptors(image_path, label_path=None, img_width=None, im
 
 
 def load_class_names():
-    """Cargar nombres de clases"""
+    """Cargar nombres de clases desde data.yaml"""
     data_yaml_path = "dataset/Billetes Mexicanos.v5i.yolov8/data.yaml"
 
     if os.path.exists(data_yaml_path):
@@ -147,21 +161,36 @@ def load_class_names():
             names = data.get('names', [])
             return {i: name for i, name in enumerate(names)}
 
-    return {0: '1', 1: '100', 2: '1000', 3: '20', 4: '200', 5: '5', 6: '50', 7: '500', 8: '500 nuevo'}
+    # Mapeo por defecto
+    return {
+        0: '1',
+        1: '100',
+        2: '1000',
+        3: '20',
+        4: '200',
+        5: '5',
+        6: '50',
+        7: '500',
+        8: '500 nuevo'
+    }
 
 
 def train_and_save_model():
-    """Entrenar y guardar el modelo"""
+    """Entrenar y guardar el modelo SVM"""
     base_dataset_path = "dataset/Billetes Mexicanos.v5i.yolov8"
 
     if not os.path.exists(base_dataset_path):
         print("❌ Error: No se encontró el dataset")
+        print(f"   Buscando en: {os.path.abspath(base_dataset_path)}")
         return
 
     print(f"🗂️  Dataset: {base_dataset_path}\n")
 
     class_names = load_class_names()
-    print(f"📋 Clases: {len(class_names)}\n")
+    print(f"📋 Clases detectadas: {len(class_names)}")
+    for idx, name in class_names.items():
+        print(f"   {idx}: ${name} pesos")
+    print()
 
     splits = {
         'train': os.path.join(base_dataset_path, 'train'),
@@ -176,6 +205,7 @@ def train_and_save_model():
         label_dir = os.path.join(split_path, 'labels')
 
         if not os.path.exists(img_dir) or not os.path.exists(label_dir):
+            print(f"⚠️  {split_name}: No encontrado, omitiendo...")
             continue
 
         print(f"📁 Procesando {split_name}...")
@@ -210,7 +240,9 @@ def train_and_save_model():
             data[split_name][1].append(label)
             count += 1
 
-        print(f"   ✓ {count} imágenes | ⚠️ {errors} errores")
+        print(f"   ✓ {count} imágenes procesadas")
+        if errors > 0:
+            print(f"   ⚠️  {errors} errores")
 
     X_train, y_train = data['train']
     X_valid, y_valid = data['valid']
@@ -223,15 +255,24 @@ def train_and_save_model():
     print(f"\n{'=' * 60}")
     print(f"📊 RESUMEN:")
     print(f"{'=' * 60}")
-    print(f"Train: {len(X_train)} | Valid: {len(X_valid)} | Test: {len(X_test)}")
+    print(f"Train: {len(X_train)} imágenes")
+    print(f"Valid: {len(X_valid)} imágenes")
+    print(f"Test: {len(X_test)} imágenes")
     print(f"Features por imagen: {len(X_train[0])}")
     print(f"Clases en train: {sorted(set(y_train))}")
-    print(f"Clases en valid: {sorted(set(y_valid))}")
-    print(f"Clases en test: {sorted(set(y_test))}")
     print(f"{'=' * 60}\n")
 
+    # Mostrar distribución
+    from collections import Counter
+    dist = Counter(y_train)
+    print(f"💵 Distribución de clases:")
+    for class_id in sorted(dist.keys()):
+        name = class_names.get(class_id, str(class_id))
+        print(f"   ${name:15s}: {dist[class_id]:3d} imágenes")
+    print()
+
     # Escalar
-    print("⚙️  Escalando...")
+    print("⚙️  Escalando características...")
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
 
@@ -241,28 +282,31 @@ def train_and_save_model():
         X_test = scaler.transform(X_test)
 
     # Entrenar SVM
-    print("🤖 Entrenando SVM mejorado...")
+    print("🤖 Entrenando SVM con parámetros optimizados...")
     clf = SVC(
         kernel='rbf',
         C=10.0,
         gamma='scale',
         probability=True,
-        class_weight='balanced'
+        class_weight='balanced',
+        random_state=42
     )
     clf.fit(X_train, y_train)
-    print("✓ Entrenado!\n")
+    print("✓ Modelo entrenado!\n")
 
-    # Evaluar en validation
+    # Evaluar
+    train_acc = accuracy_score(y_train, clf.predict(X_train))
+
+    valid_acc = None
     if len(X_valid) > 0:
         y_pred_valid = clf.predict(X_valid)
-        acc_valid = accuracy_score(y_valid, y_pred_valid)
+        valid_acc = accuracy_score(y_valid, y_pred_valid)
 
         print(f"{'=' * 60}")
         print("📈 VALIDATION:")
         print(f"{'=' * 60}")
-        print(f"Accuracy: {acc_valid:.4f}\n")
+        print(f"Accuracy: {valid_acc:.4f}\n")
 
-        # Obtener clases únicas presentes en valid
         unique_classes = sorted(set(y_valid))
         target_names = [class_names.get(i, str(i)) for i in unique_classes]
 
@@ -274,17 +318,16 @@ def train_and_save_model():
             zero_division=0
         ))
 
-    # Evaluar en test
+    test_acc = None
     if len(X_test) > 0:
         y_pred_test = clf.predict(X_test)
-        acc_test = accuracy_score(y_test, y_pred_test)
+        test_acc = accuracy_score(y_test, y_pred_test)
 
         print(f"\n{'=' * 60}")
         print("📈 TEST:")
         print(f"{'=' * 60}")
-        print(f"Accuracy: {acc_test:.4f}\n")
+        print(f"Accuracy: {test_acc:.4f}\n")
 
-        # Obtener clases únicas presentes en test
         unique_classes = sorted(set(y_test))
         target_names = [class_names.get(i, str(i)) for i in unique_classes]
 
@@ -302,9 +345,9 @@ def train_and_save_model():
         'scaler': scaler,
         'class_names': class_names,
         'feature_count': len(X_train[0]),
-        'train_accuracy': accuracy_score(y_train, clf.predict(X_train)),
-        'valid_accuracy': acc_valid if len(X_valid) > 0 else None,
-        'test_accuracy': acc_test if len(X_test) > 0 else None
+        'train_accuracy': train_acc,
+        'valid_accuracy': valid_acc,
+        'test_accuracy': test_acc
     }
 
     os.makedirs('models', exist_ok=True)
@@ -318,11 +361,13 @@ def train_and_save_model():
     print(f"{'=' * 60}")
     print(f"Ruta: {model_path}")
     print(f"Tamaño: {os.path.getsize(model_path) / 1024:.2f} KB")
-    print(f"Train Acc: {model_data['train_accuracy']:.4f}")
-    print(f"Valid Acc: {model_data['valid_accuracy']:.4f}")
-    print(f"Test Acc: {model_data['test_accuracy']:.4f}")
+    print(f"Train Acc: {train_acc:.4f}")
+    if valid_acc:
+        print(f"Valid Acc: {valid_acc:.4f}")
+    if test_acc:
+        print(f"Test Acc: {test_acc:.4f}")
     print(f"{'=' * 60}\n")
-    print("✅ ¡Listo! Ahora puedes usar el modelo en PhotoEscom")
+    print("✅ ¡Listo! Puedes usar el modelo en PhotoEscom")
 
 
 if __name__ == "__main__":
