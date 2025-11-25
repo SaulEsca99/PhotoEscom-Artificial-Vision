@@ -1,3 +1,4 @@
+from inference_sdk import InferenceHTTPClient
 from vision_methods import OtsuThreshold, HarrisCornerDetector
 from skeleton_perimeter import SkeletonizationMethods, PerimeterAnalysis
 from segmentation_template import ImageSegmentation, TemplateMatching
@@ -65,6 +66,22 @@ class PhotoEditor:
         self.template_method_var = tk.StringVar(value="opencv")
         self.template_image = None
 
+        # Para reconocimiento
+        self.clf = None
+        self.scaler = None
+        self.conf_threshold_var = tk.DoubleVar(value=0.1)  # Nuevo: umbral ajustable
+        self.preprocess_var = tk.BooleanVar(value=True)  # Nuevo: preprocesar imagen
+
+        # Traces para previews
+        self.brightness_var.trace('w', self.preview_adjustments)
+        self.contrast_var.trace('w', self.preview_adjustments)
+        self.saturation_var.trace('w', self.preview_adjustments)
+        self.sharpen_var.trace('w', self.preview_adjustments)
+
+        self.rotate_var.trace('w', self.preview_transforms)
+        self.scale_x_var.trace('w', self.preview_transforms)
+        self.scale_y_var.trace('w', self.preview_transforms)
+
         # Configurar estilo
         self.setup_styles()
 
@@ -104,8 +121,6 @@ class PhotoEditor:
         # Panel principal
         main_panel = ttk.Frame(self.root)
         main_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-        # *** INICIO DE LA MODIFICACIÓN ***
 
         # Panel de herramientas izquierdo (ÚNICO)
         # Ajustamos el ancho a 300 para que no sea tan grande
@@ -148,6 +163,9 @@ class PhotoEditor:
         template_frame = ttk.Frame(tools_notebook, padding=10)
         tools_notebook.add(template_frame, text="Template")
 
+        recognition_frame = ttk.Frame(tools_notebook, padding=10)
+        tools_notebook.add(recognition_frame, text="Reconocimiento")
+
         # --- Panel de visualización ---
         self.image_frame = ttk.Frame(main_panel)
         self.image_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -170,19 +188,242 @@ class PhotoEditor:
         self.create_perimeter_panel(perimeter_frame)
         self.create_segmentation_panel(segmentation_frame)
         self.create_template_panel(template_frame)
-
-        # *** FIN DE LA MODIFICACIÓN ***
+        self.create_recognition_panel(recognition_frame)
 
         # Barra de estado
         self.status_bar = ttk.Label(self.root, text="PhotoEscom - Listo. Cargue una imagen para comenzar")
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # ========== MÉTODOS PARA NUEVAS FUNCIONALIDADES ==========
+    def create_recognition_panel(self, parent):
+        """Panel para reconocimiento de billetes"""
+        info_text = """Reconocimiento de Billetes:
 
-    # *** MÉTODO ELIMINADO ***
-    # Ya no necesitamos create_advanced_tools_notebook
-    # def create_advanced_tools_notebook(self, main_panel):
-    #    ...
+Usa IA para identificar billetes mexicanos."""
+
+        ttk.Label(parent, text=info_text, justify=tk.LEFT, wraplength=250).pack(pady=10)
+
+        # Umbral de confianza ajustable
+        ttk.Label(parent, text="Umbral de Confianza:").pack(anchor=tk.W, padx=5)
+        ttk.Scale(parent, from_=0.0, to=1.0, variable=self.conf_threshold_var).pack(fill=tk.X, padx=5)
+        self.conf_label = ttk.Label(parent, text=f"{self.conf_threshold_var.get():.2f}")
+        self.conf_label.pack(pady=5)
+        self.conf_threshold_var.trace('w', self.update_conf_label)
+
+        # Checkbox para preprocesar
+        ttk.Checkbutton(parent, text="Preprocesar imagen (mejorar contraste)", variable=self.preprocess_var).pack(anchor=tk.W, pady=5)
+
+        ttk.Button(parent, text="Reconocer Billete",
+                   command=self.apply_recognition).pack(pady=10, fill=tk.X, padx=5)
+
+        self.recognition_result_label = ttk.Label(parent, text="", wraplength=250)
+        self.recognition_result_label.pack(pady=10)
+
+    def update_conf_label(self, *args):
+        self.conf_label.config(text=f"{self.conf_threshold_var.get():.2f}")
+
+    def apply_recognition(self):
+        """Aplicar reconocimiento de billetes MEJORADO"""
+        if not self.current_image:
+            messagebox.showwarning("Advertencia", "No hay imagen")
+            return
+
+        try:
+            import pickle
+            from inference_sdk import InferenceHTTPClient
+
+            # Cargar modelo entrenado (opcional)
+            model_path = 'models/bill_recognizer.pkl'
+            if os.path.exists(model_path):
+                with open(model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                print(f"✓ Modelo SVM cargado (Test Acc: {model_data.get('test_accuracy', 0):.2%})")
+            else:
+                print("⚠️  Modelo SVM no encontrado, usando solo Roboflow")
+
+            # Guardar imagen temporal
+            temp_path = os.path.abspath("temp_recognition.jpg")
+
+            # Asegurarse de guardar la imagen correctamente
+            try:
+                # Si la imagen actual es muy grande, redimensionar
+                img_to_save = self.current_image.copy()
+                max_size = 1920
+                if max(img_to_save.size) > max_size:
+                    ratio = max_size / max(img_to_save.size)
+                    new_size = (int(img_to_save.size[0] * ratio), int(img_to_save.size[1] * ratio))
+                    img_to_save = img_to_save.resize(new_size, Image.Resampling.LANCZOS)
+                    print(f"✓ Imagen redimensionada a {new_size}")
+
+                img_to_save.save(temp_path, quality=95)
+                print(f"✓ Imagen guardada en: {temp_path}")
+
+                # Verificar que se guardó
+                if not os.path.exists(temp_path):
+                    raise Exception("No se pudo guardar la imagen temporal")
+
+                file_size = os.path.getsize(temp_path) / 1024
+                print(f"✓ Tamaño: {file_size:.2f} KB")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al guardar imagen: {e}")
+                return
+
+            # Preprocesado opcional
+            if self.preprocess_var.get():
+                img_cv = cv2.imread(temp_path)
+                lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                img_cv = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                cv2.imwrite(temp_path, img_cv)
+                print("✓ Preprocesamiento aplicado")
+
+            # Inferencia con Roboflow
+            try:
+                CLIENT = InferenceHTTPClient(
+                    api_url="https://serverless.roboflow.com",
+                    api_key="tkhi9LqnfsZxo8AK0ULH"
+                )
+
+                # Usar versión 1 que funciona mejor
+                print("🔍 Conectando con Roboflow API...")
+                result = CLIENT.infer(temp_path, model_id="billetes-mexicanos-9s5an/1")
+                print(f"✓ Respuesta recibida en {result.get('time', 0):.3f}s")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Error con Roboflow API:\n{str(e)}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return
+
+            print("\n" + "=" * 60)
+            print("🔍 RESULTADOS DE DETECCIÓN")
+            print("=" * 60)
+
+            # Procesar resultados
+            img = cv2.imread(temp_path)
+            if img is None:
+                messagebox.showerror("Error", "No se pudo leer la imagen temporal")
+                os.remove(temp_path)
+                return
+
+            h_img, w_img = img.shape[:2]
+            detections = []
+
+            if 'predictions' in result and result['predictions']:
+                predictions = result['predictions']
+                conf_threshold = self.conf_threshold_var.get()
+
+                print(f"Predicciones totales: {len(predictions)}")
+                print(f"Umbral de confianza: {conf_threshold:.0%}")
+
+                for i, pred in enumerate(predictions, 1):
+                    confidence = pred['confidence']
+                    class_name = pred['class']
+
+                    print(f"\nPredicción #{i}:")
+                    print(f"  Clase: ${class_name}")
+                    print(f"  Confianza: {confidence:.2%}")
+
+                    if confidence >= conf_threshold:
+                        x, y, w, h = pred['x'], pred['y'], pred['width'], pred['height']
+                        x1 = max(0, int(x - w / 2))
+                        y1 = max(0, int(y - h / 2))
+                        x2 = min(w_img, int(x + w / 2))
+                        y2 = min(h_img, int(y + h / 2))
+
+                        # Color según confianza
+                        if confidence >= 0.7:
+                            color = (0, 255, 0)  # Verde
+                            label_bg = (0, 180, 0)
+                        elif confidence >= 0.5:
+                            color = (0, 255, 255)  # Amarillo
+                            label_bg = (0, 180, 180)
+                        else:
+                            color = (0, 165, 255)  # Naranja
+                            label_bg = (0, 120, 200)
+
+                        # Dibujar rectángulo
+                        cv2.rectangle(img, (x1, y1), (x2, y2), color, 4)
+
+                        # Preparar texto
+                        label = f"${class_name} ({confidence:.0%})"
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.9
+                        thickness = 2
+
+                        # Calcular tamaño del texto
+                        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+                        # Dibujar fondo del texto
+                        cv2.rectangle(img,
+                                      (x1, y1 - th - baseline - 12),
+                                      (x1 + tw + 12, y1),
+                                      label_bg, -1)
+
+                        # Dibujar borde del texto
+                        cv2.rectangle(img,
+                                      (x1, y1 - th - baseline - 12),
+                                      (x1 + tw + 12, y1),
+                                      color, 2)
+
+                        # Dibujar texto
+                        cv2.putText(img, label,
+                                    (x1 + 6, y1 - baseline - 6),
+                                    font, font_scale, (255, 255, 255), thickness)
+
+                        detections.append(f"${class_name} ({confidence:.0%})")
+                        print(f"  ✓ DETECTADO")
+                    else:
+                        print(f"  ✗ Rechazado (< {conf_threshold:.0%})")
+
+                # Actualizar interfaz
+                if detections:
+                    result_text = f"✓ Detectados:\n\n" + "\n".join(detections)
+                    self.recognition_result_label.config(text=result_text)
+                    self.status_bar.config(text=f"✓ {len(detections)} billetes detectados")
+                    print(f"\n✅ Total detectados: {len(detections)}")
+                else:
+                    # Mostrar las mejores predicciones aunque no pasen el umbral
+                    top_preds = sorted(predictions, key=lambda p: p['confidence'], reverse=True)[:3]
+                    result_text = f"⚠️ Sin detecciones\n(umbral={conf_threshold:.0%})\n\n"
+                    result_text += "Mejores predicciones:\n"
+                    for p in top_preds:
+                        result_text += f"${p['class']}: {p['confidence']:.0%}\n"
+
+                    self.recognition_result_label.config(text=result_text)
+                    self.status_bar.config(text="Baja el umbral para ver más")
+                    print(f"\n⚠️ Ninguna predicción supera {conf_threshold:.0%}")
+
+                # Convertir y mostrar imagen con detecciones
+                result_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                self.current_image = result_pil
+                self.add_to_history()
+                self.display_image_on_canvas()
+
+            else:
+                result_text = "❌ No hay predicciones\n\nVerifica:\n• La imagen tiene billetes\n• Los billetes son visibles\n• Intenta preprocesar"
+                self.recognition_result_label.config(text=result_text)
+                self.status_bar.config(text="Sin predicciones")
+                print("❌ La API no devolvió predicciones")
+
+            # Limpiar archivo temporal
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                print(f"✓ Archivo temporal eliminado")
+
+            print("=" * 60 + "\n")
+
+        except Exception as e:
+            error_msg = f"Error en reconocimiento:\n{str(e)}"
+            messagebox.showerror("Error", error_msg)
+            print(f"\n❌ ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Limpiar
+            if os.path.exists("temp_recognition.jpg"):
+                os.remove("temp_recognition.jpg")
 
     def create_otsu_panel(self, parent):
         """Panel para método de Otsu"""
@@ -219,6 +460,18 @@ de interés en la imagen."""
                         variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
         ttk.Radiobutton(parent, text="OpenCV", value="opencv",
                         variable=self.harris_method_var).pack(anchor=tk.W, padx=20)
+
+        # Parámetros
+        params_frame = ttk.LabelFrame(parent, text="Parámetros", padding=5)
+        params_frame.pack(fill=tk.X, pady=5, padx=5)
+
+        ttk.Label(params_frame, text="k:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0.01, to=0.2, variable=self.harris_k_var).grid(row=0, column=1, sticky=tk.EW)
+
+        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0.001, to=0.1, variable=self.harris_threshold_var).grid(row=1, column=1, sticky=tk.EW)
+
+        params_frame.columnconfigure(1, weight=1)
 
         ttk.Button(parent, text="Detectar Esquinas",
                    command=self.apply_harris).pack(pady=10, fill=tk.X, padx=5)
@@ -294,6 +547,10 @@ Divide la imagen en regiones."""
         ttk.Label(params_frame, text="Clusters:").grid(row=0, column=0, sticky=tk.W)
         ttk.Scale(params_frame, from_=2, to=10,
                   variable=self.seg_clusters_var).grid(row=0, column=1, sticky=tk.EW)
+
+        ttk.Label(params_frame, text="Threshold:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Scale(params_frame, from_=0, to=255,
+                  variable=self.seg_threshold_var).grid(row=1, column=1, sticky=tk.EW)
 
         params_frame.columnconfigure(1, weight=1)
 
@@ -381,14 +638,16 @@ la imagen."""
         try:
             img_array = np.array(self.history[self.history_index])
             method = self.harris_method_var.get()
+            k = self.harris_k_var.get()
+            threshold = self.harris_threshold_var.get()
 
             if method == "manual":
                 corners_img, response, coords = HarrisCornerDetector.detect_corners_manual(
-                    img_array, k=0.04, threshold=0.01
+                    img_array, k=k, threshold=threshold
                 )
             else:
                 corners_img, response, coords = HarrisCornerDetector.detect_corners_opencv(
-                    img_array, k=0.04, threshold=0.01
+                    img_array, k=k, threshold=threshold
                 )
 
             result_pil = Image.fromarray(corners_img)
@@ -930,11 +1189,8 @@ la imagen."""
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    # [Continúa con el resto de métodos originales...]
-    # (create_edge_detection_panel, create_top_toolbar, etc.)
-
     def create_edge_detection_panel(self, parent):
-        """Panel de detección de bordes (tu código original)"""
+        """Panel de detección de bordes"""
         canvas = tk.Canvas(parent, bg=self.frame_bg, highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
@@ -1000,6 +1256,31 @@ la imagen."""
         sigma_value = ttk.Label(params_frame, text="1.0", width=5)
         sigma_value.grid(row=1, column=2, padx=(5, 0), pady=5)
 
+        ttk.Label(params_frame, text="Canny Low:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        canny_low_scale = ttk.Scale(params_frame, from_=0, to=255, variable=self.canny_low_var)
+        canny_low_scale.grid(row=2, column=1, sticky=tk.EW, pady=5, padx=(5, 0))
+        canny_low_value = ttk.Label(params_frame, text="50", width=5)
+        canny_low_value.grid(row=2, column=2, padx=(5, 0), pady=5)
+
+        ttk.Label(params_frame, text="Canny High:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        canny_high_scale = ttk.Scale(params_frame, from_=0, to=255, variable=self.canny_high_var)
+        canny_high_scale.grid(row=3, column=1, sticky=tk.EW, pady=5, padx=(5, 0))
+        canny_high_value = ttk.Label(params_frame, text="150", width=5)
+        canny_high_value.grid(row=3, column=2, padx=(5, 0), pady=5)
+
+        ttk.Label(params_frame, text="Roberts Form:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        ttk.Radiobutton(params_frame, text="Sqrt", value="sqrt", variable=self.roberts_form_var).grid(row=4, column=1, sticky=tk.W)
+        ttk.Radiobutton(params_frame, text="Abs", value="abs", variable=self.roberts_form_var).grid(row=4, column=2, sticky=tk.W)
+
+        ttk.Checkbutton(params_frame, text="Mostrar Magnitud", variable=self.show_magnitude_var).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        ttk.Checkbutton(params_frame, text="Mostrar Ángulo", variable=self.show_angle_var).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        ttk.Label(params_frame, text="Sobel Extendido:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        ttk.Radiobutton(params_frame, text="3x3", value=3, variable=self.extended_size_var).grid(row=7, column=1, sticky=tk.W)
+        ttk.Radiobutton(params_frame, text="5x5", value=5, variable=self.extended_size_var).grid(row=7, column=2, sticky=tk.W)
+        ttk.Radiobutton(params_frame, text="7x7", value=7, variable=self.extended_size_var).grid(row=8, column=1, sticky=tk.W)
+
         params_frame.columnconfigure(1, weight=1)
 
         # Botones
@@ -1014,9 +1295,13 @@ la imagen."""
         def update_param_values(*args):
             threshold_value.config(text=f"{self.threshold_var.get():.0f}")
             sigma_value.config(text=f"{self.sigma_var.get():.1f}")
+            canny_low_value.config(text=f"{self.canny_low_var.get():.0f}")
+            canny_high_value.config(text=f"{self.canny_high_var.get():.0f}")
 
         self.threshold_var.trace('w', update_param_values)
         self.sigma_var.trace('w', update_param_values)
+        self.canny_low_var.trace('w', update_param_values)
+        self.canny_high_var.trace('w', update_param_values)
 
     def update_operator_info(self, *args):
         """Actualizar información del operador"""
@@ -1036,7 +1321,7 @@ la imagen."""
             self.operator_info.config(text=info_texts.get(operator, ""))
 
     def create_top_toolbar(self):
-        """Barra de herramientas superior (tu código original)"""
+        """Barra de herramientas superior"""
         toolbar = ttk.Frame(self.root, height=50)
         toolbar.pack(fill=tk.X, padx=10, pady=(10, 5))
         toolbar.pack_propagate(False)
@@ -1053,16 +1338,14 @@ la imagen."""
         ttk.Button(toolbar, text="↷ Rehacer", command=self.redo, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="🔄 Restaurar", command=self.reset_image, width=12).pack(side=tk.LEFT, padx=5)
 
-        # *** AÑADIR BOTONES DE ZOOM ***
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
 
         ttk.Button(toolbar, text="➕ Zoom In", command=self.zoom_in, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="➖ Zoom Out", command=self.zoom_out, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="📏 Ajustar", command=self.zoom_fit, width=10).pack(side=tk.LEFT, padx=5)
-        # *** FIN DE BOTONES DE ZOOM ***
 
     def create_image_canvas(self):
-        """Crear canvas de imagen (tu código original)"""
+        """Crear canvas de imagen"""
         canvas_container = ttk.Frame(self.image_frame)
         canvas_container.pack(fill=tk.BOTH, expand=True)
 
@@ -1150,8 +1433,6 @@ la imagen."""
                             variable=self.filter_var, command=self.apply_filter).grid(row=i, column=0, sticky=tk.W,
                                                                                       pady=2)
 
-    # Métodos de funcionalidad básica (tu código original)
-
     def load_image(self):
         """Cargar imagen"""
         file_path = filedialog.askopenfilename(filetypes=[("Imágenes", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp")])
@@ -1163,12 +1444,8 @@ la imagen."""
                 self.history = [self.current_image.copy()]
                 self.history_index = 0
 
-                # *** CORRECCIÓN DE AUTO-AJUSTE ***
                 self.reset_controls()
-                # Llamar a zoom_fit() en lugar de setear zoom_factor=1.0
                 self.zoom_fit()
-                # *** FIN DE CORRECCIÓN ***
-
                 self.display_image_on_canvas()
                 self.update_info()
                 self.status_bar.config(text=f"PhotoEscom - Imagen cargada: {self.filename}")
@@ -1202,7 +1479,6 @@ la imagen."""
             new_width = int(width * self.zoom_factor)
             new_height = int(height * self.zoom_factor)
 
-            # Asegurarse de que el tamaño no sea cero
             if new_width <= 0: new_width = 1
             if new_height <= 0: new_height = 1
 
@@ -1266,7 +1542,6 @@ la imagen."""
             self.current_image = self.original_image.copy()
             self.add_to_history()
             self.reset_controls()
-            # Ajustar al lienzo al resetear
             self.zoom_fit()
             self.display_image_on_canvas()
 
@@ -1280,14 +1555,19 @@ la imagen."""
         self.add_to_history()
         self.display_image_on_canvas()
 
-    def preview_transform(self, transform_type):
-        """Vista previa de transformación"""
+    def preview_transforms(self, *args):
+        """Vista previa de transformaciones"""
         if not self.current_image:
             return
         img = self.history[self.history_index].copy()
-        if transform_type == 'rotate':
-            angle = self.rotate_var.get()
+        angle = self.rotate_var.get()
+        if angle != 0:
             img = img.rotate(angle, expand=True)
+        scale_x = self.scale_x_var.get()
+        scale_y = self.scale_y_var.get()
+        if scale_x != 1.0 or scale_y != 1.0:
+            new_size = (int(img.width * scale_x), int(img.height * scale_y))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
         self.current_image = img
         self.display_image_on_canvas()
 
@@ -1295,13 +1575,10 @@ la imagen."""
         """Aplicar transformaciones"""
         if not self.current_image:
             return
-        img = self.history[self.history_index].copy()
-        angle = self.rotate_var.get()
-        if angle != 0:
-            img = img.rotate(angle, expand=True)
-        self.current_image = img
         self.add_to_history()
-        self.display_image_on_canvas()
+        self.rotate_var.set(0)
+        self.scale_x_var.set(1.0)
+        self.scale_y_var.set(1.0)
 
     def apply_flip(self, direction):
         """Voltear imagen"""
@@ -1316,8 +1593,8 @@ la imagen."""
         self.add_to_history()
         self.display_image_on_canvas()
 
-    def apply_adjustments(self):
-        """Aplicar ajustes"""
+    def preview_adjustments(self, *args):
+        """Vista previa de ajustes"""
         if not self.current_image:
             return
         img = self.history[self.history_index].copy()
@@ -1325,6 +1602,18 @@ la imagen."""
         if brightness != 1.0:
             enhancer = ImageEnhance.Brightness(img)
             img = enhancer.enhance(brightness)
+        contrast = self.contrast_var.get()
+        if contrast != 1.0:
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(contrast)
+        saturation = self.saturation_var.get()
+        if saturation != 1.0:
+            enhancer = ImageEnhance.Color(img)
+            img = enhancer.enhance(saturation)
+        sharpen = self.sharpen_var.get()
+        if sharpen != 1.0:
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(sharpen)
         self.current_image = img
         self.display_image_on_canvas()
 
@@ -1383,29 +1672,24 @@ la imagen."""
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
 
-        # Añadir un pequeño padding para que no quede pegado al borde
         canvas_width -= 10
         canvas_height -= 10
 
         if canvas_width <= 0 or canvas_height <= 0:
-            # El lienzo aún no tiene tamaño, no se puede ajustar
-            # Usar 1.0 como fallback
             self.zoom_factor = 1.0
             self.display_image_on_canvas()
             return
 
         img_width, img_height = self.current_image.size
         if img_width <= 0 or img_height <= 0:
-            return  # Imagen inválida
+            return
 
-        # Calcular ratios
         ratio_w = canvas_width / img_width
         ratio_h = canvas_height / img_height
 
-        # El nuevo zoom es el mínimo de los dos ratios
         self.zoom_factor = min(ratio_w, ratio_h)
 
-        if self.zoom_factor <= 0:  # Evitar zoom negativo o cero
+        if self.zoom_factor <= 0:
             self.zoom_factor = 0.1
 
         self.display_image_on_canvas()
@@ -1423,9 +1707,6 @@ la imagen."""
     def on_resize(self, event):
         """Evento de redimensionamiento"""
         if event.widget == self.root:
-            # Re-ajustar la imagen si la ventana cambia de tamaño
-            # Podríamos ser más inteligentes aquí, pero por ahora solo
-            # redibujamos.
             self.display_image_on_canvas()
 
 

@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 11
+names: ['1', '100', '1000', '20', '200', '5', '50', '500', '500 nuevo', 'Billete 500 Nuevo Frente', 'bills']
+
+roboflow:
+  workspace: deforestarion-index-neurons-and-neural-networks
+  project: billetes-mexicanos
+  version: 5
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/deforestarion-index-neurons-and-neural-networks/billetes-mexicanos/dataset/5
