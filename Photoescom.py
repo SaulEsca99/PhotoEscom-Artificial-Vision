@@ -1538,7 +1538,6 @@ la imagen."""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def on_resize(self, event):
-        """Evento de redimensionamiento"""
         if event.widget == self.root:
             self.display_image_on_canvas()
 
